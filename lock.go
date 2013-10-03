@@ -8,14 +8,14 @@ import (
 )
 
 var (
-	// LockTimeout is returned by LockWait() when the lock expires.
-	LockTimeout = errors.New("lock timeout")
+	// ErrLockTimeout is returned by LockWait() when the lock expires.
+	ErrLockTimeout = errors.New("lock timeout")
 )
 
 // Lock is a Redis-based lock.
 type Lock struct {
-	r   redis.Conn
-	Key string
+	pool *redis.Pool
+	Key  string
 	// Set the expiry time.
 	Expiry  time.Duration
 	lock    sync.Mutex
@@ -25,9 +25,9 @@ type Lock struct {
 }
 
 // NewLock creates a new Redis lock.
-func NewLock(r redis.Conn, key string) *Lock {
+func NewLock(pool *redis.Pool, key string) *Lock {
 	return &Lock{
-		r:       r,
+		pool:    pool,
 		Key:     key,
 		Expiry:  time.Second * 2,
 		errors:  make(chan error, 1),
@@ -42,12 +42,14 @@ func (l *Lock) Lock() error {
 }
 
 // LockWait is a non-blocking lock. Returns nil if the lock is acquired,
-// LockTimeout if the timeout is reached, or any Redis error.
+// ErrLockTimeout if the timeout is reached, or any Redis error.
 func (l *Lock) LockWait(wait time.Duration) error {
 	l.lock.Lock()
+	r := l.pool.Get()
+	defer r.Close()
 	expire := time.Now().Add(wait)
 	for {
-		v, err := l.r.Do("SET", l.Key, 1, "NX", "PX", l.Expiry.Nanoseconds()/1000000)
+		v, err := r.Do("SET", l.Key, 1, "NX", "PX", l.Expiry.Nanoseconds()/1000000)
 		if err != nil {
 			l.lock.Unlock()
 			return err
@@ -59,7 +61,7 @@ func (l *Lock) LockWait(wait time.Duration) error {
 		time.Sleep(l.Expiry)
 		if time.Now().After(expire) {
 			l.lock.Unlock()
-			return LockTimeout
+			return ErrLockTimeout
 		}
 	}
 
@@ -71,7 +73,9 @@ func (l *Lock) LockWait(wait time.Duration) error {
 func (l *Lock) heartbeat() {
 	wait := time.Tick(l.Expiry / 4)
 	for {
-		_, err := l.r.Do("SET", l.Key, 1, "XX", "PX", l.Expiry.Nanoseconds()/1000000)
+		r := l.pool.Get()
+		_, err := r.Do("SET", l.Key, 1, "XX", "PX", l.Expiry.Nanoseconds()/1000000)
+		r.Close()
 		if err != nil {
 			l.errors <- err
 			return

@@ -2,9 +2,15 @@ package grt
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"github.com/garyburd/redigo/redis"
 	"log"
+)
+
+var (
+	// ErrAlreadyQueued is returned by Submit() when a duplicate job is submitted.
+	ErrAlreadyQueued = errors.New("job already queued")
 )
 
 // JobQueueKeyer can be implemented by a type to specify a custom job queue key.
@@ -12,28 +18,30 @@ type JobQueueKeyer interface {
 	JobQueueKey() []byte
 }
 
-// JobQueue is a basic Redis-based job queue.
+// JobQueue is a basic Redis-based job queue. Not thread-safe.
 type JobQueue struct {
-	r     redis.Conn
+	pool  *redis.Pool
 	Queue string
 }
 
 // NewJobQueue creates a new Redis-based job queue. Jobs can be any
 // JSON-encodable structure. Note that this currently relies on stable
 // ordering of encoded objects.
-func NewJobQueue(r redis.Conn, queue string) *JobQueue {
-	return &JobQueue{r: r, Queue: queue}
+func NewJobQueue(pool *redis.Pool, queue string) *JobQueue {
+	return &JobQueue{pool: pool, Queue: queue}
 }
 
 // Cleanup should be called when a job runner starts up, to return any aborted
 // in-progress jobs to the queue.
 func (c *JobQueue) Cleanup() error {
-	log.Print("Cleaning up in-progress jobs")
+	r := c.pool.Get()
+	defer r.Close()
+	log.Printf("Cleaning up in-progress jobs in %s", c.Queue)
 	// Move in-progress items back to queue
 	for {
-		v, err := c.r.Do("RPOPLPUSH", c.Queue+":processing", c.Queue)
+		v, err := r.Do("RPOPLPUSH", c.Queue+":processing", c.Queue)
 		if err != nil {
-			c.r.Close()
+			r.Close()
 			return err
 		}
 		if v == nil {
@@ -44,13 +52,26 @@ func (c *JobQueue) Cleanup() error {
 	return nil
 }
 
+// Len returns the length of the queue.
+func (c *JobQueue) Len() (int, error) {
+	r := c.pool.Get()
+	defer r.Close()
+	l, err := redis.Int(r.Do("HLEN", c.Queue+":payload"))
+	if err == redis.ErrNil {
+		return 0, nil
+	}
+	return l, err
+}
+
 // IsQueued checks whether a job is currently queued for processing, or in-progress.
 func (c *JobQueue) IsQueued(job interface{}) (bool, error) {
-	ej, err := json.Marshal(job)
+	r := c.pool.Get()
+	defer r.Close()
+	key, _, err := jobQueueMarshal(job)
 	if err != nil {
 		return false, err
 	}
-	v, err := redis.Int(c.r.Do("SISMEMBER", c.Queue+":index", ej))
+	v, err := redis.Int(r.Do("HEXISTS", c.Queue+":payload", key))
 	if err != nil {
 		return false, err
 	}
@@ -59,31 +80,36 @@ func (c *JobQueue) IsQueued(job interface{}) (bool, error) {
 
 // Submit a job for processing.
 func (c *JobQueue) Submit(job interface{}) error {
-	ej, err := json.Marshal(job)
-	if err != nil {
-		return err
-	}
+	r := c.pool.Get()
+	defer r.Close()
+	key, payload, err := jobQueueMarshal(job)
 	if queued, err := c.IsQueued(job); err != nil || queued {
-		return fmt.Errorf("Repository %s already queued", job)
+		return ErrAlreadyQueued
 	}
-	c.r.Send("MULTI")
-	c.r.Send("SADD", c.Queue+":index", ej)
-	c.r.Send("LPUSH", c.Queue, ej)
-	_, err = c.r.Do("EXEC")
+
+	r.Send("MULTI")
+	r.Send("LPUSH", c.Queue, key)
+	r.Send("HSET", c.Queue+":payload", key, payload)
+	_, err = r.Do("EXEC")
 	return err
 }
 
 // Get some work.
 func (c *JobQueue) Get(v interface{}) (*Work, error) {
-	job, err := redis.Bytes(c.r.Do("BRPOPLPUSH", c.Queue, c.Queue+":processing", 0))
+	r := c.pool.Get()
+	defer r.Close()
+	key, err := redis.Bytes(r.Do("BRPOPLPUSH", c.Queue, c.Queue+":processing", 0))
 	if err != nil {
 		return nil, err
 	}
-	err = json.Unmarshal(job, v)
-	work := &Work{c.r, c.Queue, job}
+	d, err := redis.Bytes(r.Do("HGET", c.Queue+":payload", key))
+	if err == nil {
+		err = jobQueueUnmarshal(d, v)
+	}
+	work := &Work{pool: c.pool, Queue: c.Queue, key: key}
 	if err != nil {
-		if cerr := work.Resubmit(); cerr != nil {
-			return nil, cerr
+		if rerr := work.Resubmit(); rerr != nil {
+			panic("could not resubmit job: " + rerr.Error())
 		}
 		return nil, err
 	}
@@ -93,7 +119,7 @@ func (c *JobQueue) Get(v interface{}) (*Work, error) {
 // Work represents an in-progress job. Complete() or Resubmit() *must* be called
 // after processing or a recoverable error occurs, respectively.
 type Work struct {
-	r     redis.Conn
+	pool  *redis.Pool
 	Queue string
 	key   []byte
 }
@@ -102,28 +128,39 @@ func (w *Work) String() string {
 	return fmt.Sprintf("%s:%s", w.Queue, w.key)
 }
 
-// Complete a job and remove it from the in-progress queue.
+// Complete a job and remove it from the in-progress queue. Concurrency safe.
 func (w *Work) Complete() error {
-	w.r.Send("MULTI")
-	w.r.Send("LREM", w.Queue+":processing", 0, w.key)
-	w.r.Send("SREM", w.Queue+":index", w.key)
-	_, err := w.r.Do("EXEC")
+	r := w.pool.Get()
+	defer r.Close()
+	r.Send("MULTI")
+	r.Send("LREM", w.Queue+":processing", 0, w.key)
+	r.Send("HDEL", w.Queue+":payload", w.key)
+	_, err := r.Do("EXEC")
 	return err
 }
 
-// Resubmit a job and return it to the job queue.
+// Resubmit a job and return it to the job queue. Concurrency safe.
 func (w *Work) Resubmit() error {
-	w.r.Send("MULTI")
-	w.r.Send("LREM", w.Queue+":processing", 0, w.key)
-	w.r.Send("LPUSH", w.Queue, w.key)
-	_, err := w.r.Do("EXEC")
+	r := w.pool.Get()
+	defer r.Close()
+	r.Send("MULTI")
+	r.Send("LREM", w.Queue+":processing", 0, w.key)
+	r.Send("LPUSH", w.Queue, w.key)
+	_, err := r.Do("EXEC")
 	return err
 }
 
-func (w *Work) marshal(job interface{}) (key []byte, payload []byte, err error) {
-	payload, err = json.Marshal(job)
+func jobQueueRawMarshal(v interface{}) (payload []byte, err error) {
+	payload, err = json.Marshal(v)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
+	}
+	return
+}
+
+func jobQueueMarshal(job interface{}) (key []byte, payload []byte, err error) {
+	if payload, err = jobQueueRawMarshal(job); err != nil {
+		return
 	}
 	key = payload
 	if keyer, ok := job.(JobQueueKeyer); ok {
@@ -132,6 +169,6 @@ func (w *Work) marshal(job interface{}) (key []byte, payload []byte, err error) 
 	return
 }
 
-func (w *Work) unmarshal(payload []byte, v interface{}) error {
+func jobQueueUnmarshal(payload []byte, v interface{}) error {
 	return json.Unmarshal(payload, v)
 }
